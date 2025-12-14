@@ -1,7 +1,6 @@
 # VAE-based imputation algorithm
-# 11/17/2025
+# 12/14/2025
 
-library(torch)
 
 # Variational Autoencoder (VAE) Imputation 
 # @missData: the dataframe with missing data (can take-in continuous & factor variables only)
@@ -24,27 +23,51 @@ VAE <- function(missData,
                 seed = 123) {
   # Loads tensors in R
   require(torch)
+  set.seed(seed)
   torch_manual_seed(seed)
   
   fact_cols <- names(missData)[sapply(missData, is.factor)]
   numeric_cols <- setdiff(names(missData), fact_cols)
   
   # Code factor variable to numeric matrix
-  for (col in names(missData)) {
-    if (is.factor(missData[[col]])) {
-      if (nlevels(missData[[col]]) == 2) {
-        missData[[col]] <- as.numeric(missData[[col]]) - 1
-      } else {
-        stop(paste("Column", col, "has more than 2 levels. Cannot encoding."))
+  original_cols <- colnames(missData)
+  original_types <- sapply(missData, class)
+  
+  onehot_info <- list()
+  encoded_data <- missData
+  
+  for (col in fact_cols) {
+    vec <- missData[[col]]
+    levs <- levels(vec)
+    
+    if (length(levs) > 1) {
+      onehot_mat <- matrix(0, nrow = nrow(missData), ncol = length(levs))
+      colnames(onehot_mat) <- paste0(col, "_", levs)
+      
+      for (i in seq_along(levs)) {
+        is_match <- (vec == levs[i])
+        onehot_mat[which(is_match), i] <- 1
       }
+      
+      onehot_info[[col]] <- list(cols = colnames(onehot_mat), levels = levs)
+      
+      encoded_data[[col]] <- NULL
+      encoded_data <- cbind(encoded_data, onehot_mat)
+    } else {
+      encoded_data[[col]] <- 0
     }
   }
+  
+  missData <- as.data.frame(encoded_data)
+  fact_cols <- character(0)
+  numeric_cols <- colnames(missData)
   
   x <- as.matrix(missData)
   
   # Standardization
   col_means <- colMeans(x[, numeric_cols, drop = FALSE], na.rm = TRUE)
   col_sds   <- apply(x[, numeric_cols, drop = FALSE], 2, sd, na.rm = TRUE)
+  col_sds[col_sds == 0] <- 1
   
   x_scaled <- x
   x_scaled[, numeric_cols] <- sweep(x_scaled[, numeric_cols], 2, col_means, "-")
@@ -101,7 +124,7 @@ VAE <- function(missData,
   # Initialize VAE model
   input_dim <- ncol(x)
   vae <- vae_module(input_dim = input_dim, latent_dim = latent_dim, hidden_dim = hidden_dim)
-  optimizer <- optim_adam(vae$parameters, lr = lr) #Sets up the Adam optimizer
+  optimizer <- optim_adam(vae$parameters, lr = lr) # Set up the Adam optimizer
   
   # Define loss function
   vae_loss <- function(recon_x, x, mu, logvar, mask) {
@@ -138,10 +161,21 @@ VAE <- function(missData,
   # Convert back to data frame
   imputed_data <- as.data.frame(final_imputed_data)
   colnames(imputed_data) <- colnames(missData)
-  for (col in fact_cols) {
-    imputed_data[[col]] <- round(imputed_data[[col]])
-    imputed_data[[col]] <- factor(imputed_data[[col]])
+  
+  # Decode one-hot back
+  if (length(onehot_info) > 0) {
+    for (col in names(onehot_info)) {
+      cols <- onehot_info[[col]]$cols
+      levs <- onehot_info[[col]]$levels
+      onehot_block <- as.matrix(imputed_data[, cols, drop = FALSE])
+      max_idx <- apply(onehot_block, 1, which.max)
+      imputed_data[[col]] <- factor(levs[max_idx], levels = levs)
+      imputed_data <- imputed_data[, !(names(imputed_data) %in% cols), drop = FALSE]
+    }
   }
+  
+  # Restore original column order
+  imputed_data <- imputed_data[, original_cols, drop = FALSE]
   
   # Post-imputation: lm fitting
   estimation_matrix <- NULL
@@ -165,7 +199,6 @@ VAE <- function(missData,
     )
   }
   
-  
   result <- list(
     imputed_data      = imputed_data,
     estimation_matrix = estimation_matrix  # NULL if lm.fit = FALSE
@@ -173,5 +206,3 @@ VAE <- function(missData,
   
   return(result)
 }
-
-
