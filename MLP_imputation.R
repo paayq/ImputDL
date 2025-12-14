@@ -1,5 +1,5 @@
 # MLP-based imputation algorithm
-# 12/04/2025
+# 12/14/2025
 
 # Multilayer Perceptron (MLP) Imputation
 # @missData: the dataframe with missing data (can take-in continuous & factor variables only)
@@ -33,16 +33,38 @@ MLP <- function(missData,
   # Code factor variable to numeric matrix
   fact_cols <- names(missData)[sapply(missData, is.factor)]
   numeric_cols <- setdiff(names(missData), fact_cols)
+
+  original_cols <- colnames(missData)
+  original_types <- sapply(missData, class)
   
-  for (col in names(missData)) {
-    if (is.factor(missData[[col]])) {
-      if (nlevels(missData[[col]]) == 2) {
-        missData[[col]] <- as.numeric(missData[[col]]) - 1
-      } else {
-        stop(paste("Column", col, "has more than 2 levels. Cannot encoding."))
+  onehot_info <- list()
+  encoded_data <- missData
+  
+  for (col in fact_cols) {
+    vec <- missData[[col]]
+    levs <- levels(vec)
+    
+    if (length(levs) > 1) {
+      onehot_mat <- matrix(0, nrow = nrow(missData), ncol = length(levs))
+      colnames(onehot_mat) <- paste0(col, "_", levs)
+      
+      for (i in seq_along(levs)) {
+        is_match <- (vec == levs[i])
+        onehot_mat[which(is_match), i] <- 1
       }
+      
+      onehot_info[[col]] <- list(cols = colnames(onehot_mat), levels = levs)
+      
+      encoded_data[[col]] <- NULL
+      encoded_data <- cbind(encoded_data, onehot_mat)
+    } else {
+      encoded_data[[col]] <- 0
     }
   }
+  
+  missData <- as.data.frame(encoded_data)
+  fact_cols <- character(0)
+  numeric_cols <- colnames(missData)
   
   # Missingness mask (TRUE = missing)
   miss_mask <- is.na(missData)
@@ -51,6 +73,7 @@ MLP <- function(missData,
   x <- as.data.frame(missData)
   col_means <- sapply(x[, numeric_cols, drop = FALSE], mean, na.rm = TRUE)
   col_sds   <- sapply(x[, numeric_cols, drop = FALSE], sd,   na.rm = TRUE)
+  col_sds[col_sds == 0] <- 1
   
   x_scaled <- x
   for (col in numeric_cols) {
@@ -59,12 +82,11 @@ MLP <- function(missData,
   
   # Initialize with mean impute
   x_filled <- x_scaled
-  col_means_all <- sapply(x_scaled, mean, na.rm = TRUE) # includes 0/1 cols too
+  col_means_all <- sapply(x_scaled, mean, na.rm = TRUE)
   na_idx <- which(is.na(x_filled), arr.ind = TRUE)
-  x_filled[na_idx] <- col_means_all[na_idx[, 2]]
+  if (nrow(na_idx) > 0) x_filled[na_idx] <- col_means_all[na_idx[, 2]]
   
   x_mat <- as.matrix(x_filled)
-  
   
   # MLP autoencoder
   p <- ncol(x_mat)
@@ -73,7 +95,6 @@ MLP <- function(missData,
     layer_dense(units = hidden_dim, activation = "relu", input_shape = p) %>%
     layer_dense(units = hidden_dim, activation = "relu") %>%
     layer_dense(units = p, activation = "linear")
-  
   
   # Loss
   sq_error <- function(y_true, y_pred) {
@@ -91,7 +112,6 @@ MLP <- function(missData,
   mask_rate <- 0.2
   obs_idx <- which(!miss_mask, arr.ind = TRUE)
   
- 
   for (e in seq_len(epochs)) {
     n_mask <- max(1, floor(mask_rate * nrow(obs_idx)))
     sel <- sample(seq_len(nrow(obs_idx)), size = n_mask, replace = FALSE)
@@ -127,12 +147,21 @@ MLP <- function(missData,
   # Convert back to data frame
   imputed_data <- as.data.frame(final_imputed_data)
   colnames(imputed_data) <- colnames(missData)
-
-  for (col in fact_cols) {
-    z <- round(imputed_data[[col]])
-    z <- pmin(pmax(z, 0), 1)
-    imputed_data[[col]] <- factor(z, levels = c(0, 1))
+  
+  # Decode one-hot back
+  if (length(onehot_info) > 0) {
+    for (col in names(onehot_info)) {
+      cols <- onehot_info[[col]]$cols
+      levs <- onehot_info[[col]]$levels
+      onehot_block <- as.matrix(imputed_data[, cols, drop = FALSE])
+      max_idx <- apply(onehot_block, 1, which.max)
+      imputed_data[[col]] <- factor(levs[max_idx], levels = levs)
+      imputed_data <- imputed_data[, !(names(imputed_data) %in% cols), drop = FALSE]
+    }
   }
+  
+  # Restore original column order
+  imputed_data <- imputed_data[, original_cols, drop = FALSE]
   
   # Post-imputation: lm fitting
   estimation_matrix <- NULL
