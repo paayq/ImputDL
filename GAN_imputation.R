@@ -31,13 +31,13 @@ GAN <- function(missData,
   set.seed(seed)
   tf$compat$v1$set_random_seed(as.integer(seed))
   
-  # Use TF v1 graph/session mode
+  # Use TF v1 session mode
   tf$compat$v1$disable_v2_behavior()
   
   original_cols <- colnames(missData)
   original_types <- sapply(missData, class)
   
-  # One-hot encoding for factor columns
+  # Code factor variable
   factor_cols <- sapply(missData, is.factor)
   factor_names <- names(missData)[factor_cols]
   
@@ -66,7 +66,7 @@ GAN <- function(missData,
     }
   }
   
-  # Utils: normalization + renormalization
+  # Utilities: normalization + renormalization
   normalization <- function(data_x) {
     X <- as.matrix(data_x)
     ncolx <- ncol(X)
@@ -99,7 +99,7 @@ GAN <- function(missData,
     out
   }
   
-  # Init: xavier, samplers, batch index
+  # Initialize xavier, samplers and batch index
   xavier_init <- function(shape_vec) {
     in_dim <- as.numeric(shape_vec[1])
     stddev <- 1 / sqrt(in_dim / 2.0)
@@ -118,6 +118,7 @@ GAN <- function(missData,
     if (batch_size <= no) sample(seq_len(no), batch_size, replace = FALSE)
     else sample(seq_len(no), batch_size, replace = TRUE)
   }
+  
   
   # Data prepare
   data_x <- as.data.frame(encoded_data)
@@ -200,7 +201,6 @@ GAN <- function(missData,
   
   # Losses
   eps <- 1e-8
-  
   D_loss <- -tf$reduce_sum(
     (1 - H) * (
       M * tf$math$log(D_prob + eps) +
