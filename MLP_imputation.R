@@ -10,13 +10,14 @@
 # @hidden_dim: number of neurons in hidden layer
 # @lr: learning rate
 # @lm.fit: if TRUE, fit lm and return estimation matrix, otherwise only imputed data
+# @seed: random seed
 # return: list(imputed_data, estimation_matrix)
 MLP <- function(missData,
                 outcome,
                 covariates,
                 epochs = 100,
-                batch = 64,
-                hidden_dim = 64,
+                batch = 32,
+                hidden_dim = 32,
                 lr = 0.001,
                 lm.fit = TRUE,
                 seed = 123) {
@@ -30,7 +31,7 @@ MLP <- function(missData,
     tensorflow::tf$compat$v1$enable_eager_execution()
   }
   
-  # Code factor variable to numeric matrix
+  # Code factor variable
   fact_cols <- names(missData)[sapply(missData, is.factor)]
   numeric_cols <- setdiff(names(missData), fact_cols)
 
@@ -52,6 +53,7 @@ MLP <- function(missData,
         is_match <- (vec == levs[i])
         onehot_mat[which(is_match), i] <- 1
       }
+      onehot_mat[is.na(vec), ] <- NA
       
       onehot_info[[col]] <- list(cols = colnames(onehot_mat), levels = levs)
       
@@ -66,7 +68,6 @@ MLP <- function(missData,
   fact_cols <- character(0)
   numeric_cols <- colnames(missData)
   
-  # Missingness mask (TRUE = missing)
   miss_mask <- is.na(missData)
   
   # Standardization
@@ -82,13 +83,15 @@ MLP <- function(missData,
   
   # Initialize with mean impute
   x_filled <- x_scaled
-  col_means_all <- sapply(x_scaled, mean, na.rm = TRUE)
-  na_idx <- which(is.na(x_filled), arr.ind = TRUE)
-  if (nrow(na_idx) > 0) x_filled[na_idx] <- col_means_all[na_idx[, 2]]
+  for (j in seq_along(x_filled)) {
+    m <- mean(x_filled[[j]], na.rm = TRUE)
+    x_filled[[j]][is.na(x_filled[[j]])] <- m
+  }
+  
   
   x_mat <- as.matrix(x_filled)
   
-  # MLP autoencoder
+  # Define MLP autoencoder
   p <- ncol(x_mat)
   
   model <- keras_model_sequential() %>%
@@ -96,59 +99,50 @@ MLP <- function(missData,
     layer_dense(units = hidden_dim, activation = "relu") %>%
     layer_dense(units = p, activation = "linear")
   
-  # Loss
-  sq_error <- function(y_true, y_pred) {
-    tensorflow::tf$square(y_true - y_pred)
+  # Define Masked loss
+  mask_mat <- 1 * (!miss_mask)
+  mask_mat <- matrix(mask_mat, nrow = nrow(x_mat), ncol = p)
+  y_train <- cbind(x_mat, mask_mat)
+  
+  masked_mse <- function(y_true, y_pred) {
+    p <- as.integer(dim(y_pred)[2])
+    x_true <- tensorflow::tf$slice(y_true, begin = c(0L, 0L), size = c(-1L, p))
+    mask   <- tensorflow::tf$slice(y_true, begin = c(0L, p),  size = c(-1L, p))
+    
+    err2 <- tensorflow::tf$square(x_true - y_pred)
+    num  <- tensorflow::tf$reduce_sum(err2 * mask)
+    den  <- tensorflow::tf$reduce_sum(mask) + 1e-8
+    num / den
   }
   
+  # Model fit
   model %>% compile(
-    loss = sq_error,
+    loss = masked_mse,
     optimizer = optimizer_adam(learning_rate = lr)
   )
   
-  cb <- callback_early_stopping(monitor = "loss", patience = 5, restore_best_weights = TRUE)
+  model %>% fit(
+    x = x_mat,
+    y = y_train,
+    epochs = epochs,
+    batch_size = batch,
+    verbose = 0
+  )
   
-  # Artificial masking for supervised training 
-  mask_rate <- 0.2
-  obs_idx <- which(!miss_mask, arr.ind = TRUE)
-  
-  for (e in seq_len(epochs)) {
-    n_mask <- max(1, floor(mask_rate * nrow(obs_idx)))
-    sel <- sample(seq_len(nrow(obs_idx)), size = n_mask, replace = FALSE)
-    masked_idx <- obs_idx[sel, , drop = FALSE]
-    
-    x_in <- x_mat
-    x_in[masked_idx] <- col_means_all[masked_idx[, 2]]
-    
-    train_weight <- matrix(0, nrow = nrow(x_mat), ncol = ncol(x_mat))
-    train_weight[masked_idx] <- 1
-    train_weight <- array(as.numeric(train_weight), dim = dim(train_weight))
-    
-    model %>% fit(
-      x = x_in,
-      y = x_mat,
-      sample_weight = train_weight,
-      epochs = 1,
-      batch_size = batch,
-      verbose = 0
-    )
-  }
   
   reconstructed <- model %>% predict(x_mat)
   final_imputed_data <- as.matrix(x_scaled)
   final_imputed_data[miss_mask] <- reconstructed[miss_mask]
   
-  # Back-transform numeric columns
+  # Back-transform
   final_imputed_data[, numeric_cols] <- sweep(final_imputed_data[, numeric_cols, drop = FALSE],
                                               2, col_sds, "*")
   final_imputed_data[, numeric_cols] <- sweep(final_imputed_data[, numeric_cols, drop = FALSE],
                                               2, col_means, "+")
-  
-  # Convert back to data frame
+
   imputed_data <- as.data.frame(final_imputed_data)
   colnames(imputed_data) <- colnames(missData)
   
-  # Decode one-hot back
   if (length(onehot_info) > 0) {
     for (col in names(onehot_info)) {
       cols <- onehot_info[[col]]$cols
@@ -160,7 +154,6 @@ MLP <- function(missData,
     }
   }
   
-  # Restore original column order
   imputed_data <- imputed_data[, original_cols, drop = FALSE]
   
   # Post-imputation: lm fitting
