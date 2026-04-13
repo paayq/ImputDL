@@ -14,11 +14,11 @@
 # @lm.fit: if TRUE, fit lm and return estimation matrix, otherwise only imputed data
 # @seed: random seed
 # return: list(imputed_data, estimation_matrix)
-GAN <- function(missData,
+GAN <- function(miss_data,
                 outcome,
                 covariates,
                 batch_size = 16,
-                hint_rate = 1,
+                hint_rate = 0.8,
                 alpha = 100,
                 iterations = 5000,
                 learning_rate = 0.001,
@@ -31,33 +31,39 @@ GAN <- function(missData,
   set.seed(seed)
   tf$compat$v1$set_random_seed(as.integer(seed))
   
+  if (verbose) {
+    message("Preprocessing data...")
+  }
+  
   # Use TF v1 session mode
   tf$compat$v1$disable_v2_behavior()
   
-  original_cols <- colnames(missData)
-  original_types <- sapply(missData, class)
+  original_cols <- colnames(miss_data)
+  original_types <- vapply(miss_data, function(x) class(x)[1], character(1))
   
-  # Code factor variable
-  factor_cols <- sapply(missData, is.factor)
-  factor_names <- names(missData)[factor_cols]
+  # Encode factor variables
+  factor_cols <- sapply(miss_data, is.factor)
+  factor_names <- names(miss_data)[factor_cols]
   
-  encoded_data <- missData
+  encoded_data <- miss_data
   onehot_info <- list()
   
   for (col in factor_names) {
-    vec <- missData[[col]]
-    levs <- levels(vec)
+    col_values <- miss_data[[col]]
+    factor_levels <- levels(col_values)
     
-    if (length(levs) > 1) {
-      onehot_mat <- matrix(0, nrow = length(vec), ncol = length(levs))
-      colnames(onehot_mat) <- paste0(col, "_", levs)
+    if (length(factor_levels) > 1) {
+      onehot_mat <- matrix(0, nrow = length(col_values), ncol = length(factor_levels))
+      colnames(onehot_mat) <- paste0(col, "_", factor_levels)
       
-      for (i in seq_along(levs)) {
-        is_match <- (vec == levs[i])
+      for (i in seq_along(factor_levels)) {
+        is_match <- (col_values == factor_levels[i])
         onehot_mat[which(is_match), i] <- 1
       }
       
-      onehot_info[[col]] <- list(cols = colnames(onehot_mat), levels = levs)
+      onehot_mat[is.na(col_values), ] <- NA
+      
+      onehot_info[[col]] <- list(cols = colnames(onehot_mat), levels = factor_levels)
       
       encoded_data <- encoded_data[, !(colnames(encoded_data) %in% col), drop = FALSE]
       encoded_data <- cbind(encoded_data, onehot_mat)
@@ -66,40 +72,51 @@ GAN <- function(missData,
     }
   }
   
-  # Utilities: normalization + renormalization
+  # Helper functions for normalization and renormalization
   normalization <- function(data_x) {
     X <- as.matrix(data_x)
-    ncolx <- ncol(X)
-    mins <- numeric(ncolx)
-    maxs <- numeric(ncolx)
-    norm_X <- matrix(NA_real_, nrow = nrow(X), ncol = ncolx)
+    ncol_x <- ncol(X)
+    mins <- numeric(ncol_x)
+    maxs <- numeric(ncol_x)
+    norm_X <- matrix(NA_real_, nrow = nrow(X), ncol = ncol_x)
     
-    for (j in seq_len(ncolx)) {
-      col <- X[, j]
-      mins[j] <- min(col, na.rm = TRUE)
-      maxs[j] <- max(col, na.rm = TRUE)
-      rng <- maxs[j] - mins[j]
+    for (j in seq_len(ncol_x)) {
+      col_values <- X[, j]
+      mins[j] <- min(col_values, na.rm = TRUE)
+      maxs[j] <- max(col_values, na.rm = TRUE)
+      col_range <- maxs[j] - mins[j]
       
-      if (is.na(rng) || rng == 0) norm_X[, j] <- 0 else norm_X[, j] <- (col - mins[j]) / rng
+      if (is.na(col_range) || col_range == 0) {
+        norm_X[, j] <- 0
+      } else {
+        norm_X[, j] <- (col_values - mins[j]) / col_range
+      }
     }
     
-    list(norm_data = norm_X,
-         norm_parameters = list(mins = mins, maxs = maxs))
+    list(
+      norm_data = norm_X,
+      norm_parameters = list(mins = mins, maxs = maxs)
+    )
   }
   
   renormalization <- function(norm_data, params) {
     mins <- params$mins
     maxs <- params$maxs
-    rngs <- maxs - mins
+    col_ranges <- maxs - mins
     out <- matrix(NA_real_, nrow = nrow(norm_data), ncol = ncol(norm_data))
     
     for (j in seq_len(ncol(norm_data))) {
-      if (is.na(rngs[j]) || rngs[j] == 0) out[, j] <- mins[j] else out[, j] <- norm_data[, j] * rngs[j] + mins[j]
+      if (is.na(col_ranges[j]) || col_ranges[j] == 0) {
+        out[, j] <- mins[j]
+      } else {
+        out[, j] <- norm_data[, j] * col_ranges[j] + mins[j]
+      }
     }
+    
     out
   }
   
-  # Initialize xavier, samplers and batch index
+  # Helper functions for initialization and sampling
   xavier_init <- function(shape_vec) {
     in_dim <- as.numeric(shape_vec[1])
     stddev <- 1 / sqrt(in_dim / 2.0)
@@ -114,65 +131,59 @@ GAN <- function(missData,
     matrix(rbinom(n * dim, size = 1, prob = p), nrow = n, ncol = dim)
   }
   
-  sample_batch_index <- function(no, batch_size) {
-    if (batch_size <= no) sample(seq_len(no), batch_size, replace = FALSE)
-    else sample(seq_len(no), batch_size, replace = TRUE)
+  sample_batch_index <- function(n_rows, batch_size) {
+    if (batch_size <= n_rows) sample(seq_len(n_rows), batch_size, replace = FALSE)
+    else sample(seq_len(n_rows), batch_size, replace = TRUE)
   }
   
   
-  # Data prepare
-  data_x <- as.data.frame(encoded_data)
-  data_mat <- as.matrix(data_x)
-  data_m <- 1 - is.na(data_mat) # mask: 1 observed, 0 missing
-  no <- nrow(data_mat)
-  dim <- ncol(data_mat)
-  h_dim <- dim
+  # Prepare input data
+  encoded_df <- as.data.frame(encoded_data)
+  input_matrix <- as.matrix(encoded_df)
+  obs_mask <- 1 - is.na(input_matrix) # 1 = observed, 0 = missing
+  n_rows <- nrow(input_matrix)
+  n_features <- ncol(input_matrix)
+  hidden_dim <- n_features
   
-  true_numeric_cols <- which(
+  original_numeric_cols <- which(
     sapply(encoded_data, is.numeric) &
       !(colnames(encoded_data) %in% unlist(lapply(onehot_info, function(x) x$cols)))
   )
   
-  # Normalization
-  if (length(true_numeric_cols) > 0) {
-    norm_res <- normalization(data_mat[, true_numeric_cols, drop = FALSE])
-    norm_data_x <- data_mat
-    norm_data_x[, true_numeric_cols] <- norm_res$norm_data
+  # Normalize original numeric columns
+  if (length(original_numeric_cols) > 0) {
+    norm_result <- normalization(input_matrix[, original_numeric_cols, drop = FALSE])
+    normalized_matrix <- input_matrix
+    normalized_matrix[, original_numeric_cols] <- norm_result$norm_data
   } else {
-    norm_res <- NULL
-    norm_data_x <- data_mat
+    norm_result <- NULL
+    normalized_matrix <- input_matrix
   }
   
-  norm_data_x[is.na(norm_data_x)] <- 0
-  
-  norm_data_x <- norm_data_x + matrix(
-    rnorm(length(norm_data_x), mean = 0, sd = 1e-6),
-    nrow = nrow(norm_data_x),
-    ncol = ncol(norm_data_x)
-  )
+  normalized_matrix[is.na(normalized_matrix)] <- 0
   
   # TensorFlow graph
   tf$compat$v1$reset_default_graph()
   
-  X <- tf$compat$v1$placeholder(tf$float32, shape = shape(NULL, dim), name = "X")
-  M <- tf$compat$v1$placeholder(tf$float32, shape = shape(NULL, dim), name = "M")
-  H <- tf$compat$v1$placeholder(tf$float32, shape = shape(NULL, dim), name = "H")
+  X <- tf$compat$v1$placeholder(tf$float32, shape = shape(NULL, n_features), name = "X")
+  M <- tf$compat$v1$placeholder(tf$float32, shape = shape(NULL, n_features), name = "M")
+  H <- tf$compat$v1$placeholder(tf$float32, shape = shape(NULL, n_features), name = "H")
   
   # Discriminator variables
-  D_W1 <- tf$Variable(xavier_init(c(dim * 2L, h_dim)), dtype = tf$float32)
-  D_b1 <- tf$Variable(tf$zeros(shape(as.integer(h_dim))), dtype = tf$float32)
-  D_W2 <- tf$Variable(xavier_init(c(h_dim, h_dim)), dtype = tf$float32)
-  D_b2 <- tf$Variable(tf$zeros(shape(as.integer(h_dim))), dtype = tf$float32)
-  D_W3 <- tf$Variable(xavier_init(c(h_dim, dim)), dtype = tf$float32)
-  D_b3 <- tf$Variable(tf$zeros(shape(as.integer(dim))), dtype = tf$float32)
+  D_W1 <- tf$Variable(xavier_init(c(n_features * 2L, hidden_dim)), dtype = tf$float32)
+  D_b1 <- tf$Variable(tf$zeros(shape(as.integer(hidden_dim))), dtype = tf$float32)
+  D_W2 <- tf$Variable(xavier_init(c(hidden_dim, hidden_dim)), dtype = tf$float32)
+  D_b2 <- tf$Variable(tf$zeros(shape(as.integer(hidden_dim))), dtype = tf$float32)
+  D_W3 <- tf$Variable(xavier_init(c(hidden_dim, n_features)), dtype = tf$float32)
+  D_b3 <- tf$Variable(tf$zeros(shape(as.integer(n_features))), dtype = tf$float32)
   
   # Generator variables
-  G_W1 <- tf$Variable(xavier_init(c(dim * 2L, h_dim)), dtype = tf$float32)
-  G_b1 <- tf$Variable(tf$zeros(shape(as.integer(h_dim))), dtype = tf$float32)
-  G_W2 <- tf$Variable(xavier_init(c(h_dim, h_dim)), dtype = tf$float32)
-  G_b2 <- tf$Variable(tf$zeros(shape(as.integer(h_dim))), dtype = tf$float32)
-  G_W3 <- tf$Variable(xavier_init(c(h_dim, dim)), dtype = tf$float32)
-  G_b3 <- tf$Variable(tf$zeros(shape(as.integer(dim))), dtype = tf$float32)
+  G_W1 <- tf$Variable(xavier_init(c(n_features * 2L, hidden_dim)), dtype = tf$float32)
+  G_b1 <- tf$Variable(tf$zeros(shape(as.integer(hidden_dim))), dtype = tf$float32)
+  G_W2 <- tf$Variable(xavier_init(c(hidden_dim, hidden_dim)), dtype = tf$float32)
+  G_b2 <- tf$Variable(tf$zeros(shape(as.integer(hidden_dim))), dtype = tf$float32)
+  G_W3 <- tf$Variable(xavier_init(c(hidden_dim, n_features)), dtype = tf$float32)
+  G_b3 <- tf$Variable(tf$zeros(shape(as.integer(n_features))), dtype = tf$float32)
   
   # Generator network
   generator <- function(x, m) {
@@ -201,12 +212,11 @@ GAN <- function(missData,
   
   # Losses
   eps <- 1e-8
-  D_loss <- -tf$reduce_sum(
-    (1 - H) * (
-      M * tf$math$log(D_prob + eps) +
-        (1 - M) * tf$math$log(1 - D_prob + eps)
-    )
-  ) / (tf$reduce_sum(1 - H) + eps)
+  
+  D_loss <- -tf$reduce_mean(
+    M * tf$math$log(D_prob + eps) +
+      (1 - M) * tf$math$log(1 - D_prob + eps)
+  )
   
   G_loss_temp <- -tf$reduce_mean((1 - M) * tf$math$log(D_prob + eps))
   MSE_loss <- tf$reduce_mean((M * X - M * G_sample) ^ 2) / tf$maximum(tf$reduce_mean(M), 1e-8)
@@ -234,20 +244,21 @@ GAN <- function(missData,
   sess <- tf$compat$v1$Session()
   sess$run(tf$compat$v1$global_variables_initializer())
   
-  # Training loop
   if (verbose) {
+    message("Training GAN imputation model...")
     pb <- txtProgressBar(min = 0, max = iterations, style = 3)
     on.exit(close(pb), add = TRUE)
   }
   
+  # Training loop
   for (it in seq_len(iterations)) {
-    batch_idx <- sample_batch_index(no, batch_size)
-    X_mb <- norm_data_x[batch_idx, , drop = FALSE]
-    M_mb <- data_m[batch_idx, , drop = FALSE]
+    batch_idx <- sample_batch_index(n_rows, batch_size)
+    X_mb <- normalized_matrix[batch_idx, , drop = FALSE]
+    M_mb <- obs_mask[batch_idx, , drop = FALSE]
     
-    Z_mb <- uniform_sampler(0, 0.01, n = nrow(X_mb), dim = dim)
-    H_mb_temp <- binary_sampler(hint_rate, n = nrow(X_mb), dim = dim)
-    H_mb <- M_mb * H_mb_temp
+    Z_mb <- uniform_sampler(0, 0.01, n = nrow(X_mb), dim = n_features)
+    H_mb_temp <- binary_sampler(hint_rate, n = nrow(X_mb), dim = n_features)
+    H_mb <- H_mb_temp * M_mb
     X_mb_in <- M_mb * X_mb + (1 - M_mb) * Z_mb
     
     sess$run(D_solver, feed_dict = dict(X = X_mb_in, M = M_mb, H = H_mb))
@@ -265,23 +276,23 @@ GAN <- function(missData,
   }
   if (verbose) setTxtProgressBar(pb, iterations)
   
-  # Impute
-  Z_mb <- uniform_sampler(0, 0.01, no, dim)
-  X_mb_in <- data_m * norm_data_x + (1 - data_m) * Z_mb
+  # Impute missing values
+  Z_mb <- uniform_sampler(0, 0.01, n_rows, n_features)
+  X_mb_in <- obs_mask * normalized_matrix + (1 - obs_mask) * Z_mb
   
-  imputed_data_norm <- sess$run(G_sample, feed_dict = dict(X = X_mb_in, M = data_m))
-  imputed_data_norm <- data_m * norm_data_x + (1 - data_m) * imputed_data_norm
+  imputed_data_norm <- sess$run(G_sample, feed_dict = dict(X = X_mb_in, M = obs_mask))
+  imputed_data_norm <- obs_mask * normalized_matrix + (1 - obs_mask) * imputed_data_norm
   
-  # Renormalize only true numeric columns
-  imputed_data <- matrix(0, nrow = no, ncol = ncol(data_mat))
-  if (length(true_numeric_cols) > 0 && !is.null(norm_res)) {
-    imputed_data[, true_numeric_cols] <- renormalization(
-      imputed_data_norm[, true_numeric_cols, drop = FALSE],
-      norm_res$norm_parameters
+  # Restore original scale for numeric columns
+  imputed_data <- matrix(0, nrow = n_rows, ncol = ncol(input_matrix))
+  if (length(original_numeric_cols) > 0 && !is.null(norm_result)) {
+    imputed_data[, original_numeric_cols] <- renormalization(
+      imputed_data_norm[, original_numeric_cols, drop = FALSE],
+      norm_result$norm_parameters
     )
   }
-  if (length(true_numeric_cols) < ncol(data_mat)) {
-    other_cols <- setdiff(seq_len(ncol(data_mat)), true_numeric_cols)
+  if (length(original_numeric_cols) < ncol(input_matrix)) {
+    other_cols <- setdiff(seq_len(ncol(input_matrix)), original_numeric_cols)
     imputed_data[, other_cols] <- imputed_data_norm[, other_cols, drop = FALSE]
   }
   
@@ -301,7 +312,7 @@ GAN <- function(missData,
     }
   }
   
-  final_df <- as.data.frame(matrix(NA, nrow = no, ncol = length(original_cols)))
+  final_df <- as.data.frame(matrix(NA, nrow = n_rows, ncol = length(original_cols)))
   colnames(final_df) <- original_cols
   
   for (col in original_cols) {
@@ -310,14 +321,18 @@ GAN <- function(missData,
       if (original_types[col] %in% c("integer", "numeric")) {
         final_df[[col]] <- as.numeric(final_df[[col]])
       } else if (original_types[col] == "factor") {
-        final_df[[col]] <- factor(final_df[[col]], levels = levels(missData[[col]]))
+        final_df[[col]] <- factor(final_df[[col]], levels = levels(miss_data[[col]]))
       }
     }
   }
   
   sess$close()
   
-  # Post-imputation: lm fitting
+  if (verbose) {
+    message("Done.")
+  }
+  
+  # Optional: fit the linear regression model
   estimation_matrix <- NULL
   
   if (lm.fit) {
